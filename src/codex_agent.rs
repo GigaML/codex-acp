@@ -6,7 +6,8 @@ use acp::schema::{
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
@@ -178,6 +179,24 @@ impl CodexAgent {
                         cx.spawn(async move {
                             responder
                                 .respond_with_result(agent.load_session(request, session_cx).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ResumeSessionRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        let session_cx = cx.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(
+                                agent.resume_session(request, session_cx).await,
+                            )
                         })?;
                         Ok(())
                     }
@@ -443,7 +462,8 @@ impl CodexAgent {
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+            .list(SessionListCapabilities::new())
+            .resume(SessionResumeCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -590,21 +610,26 @@ impl CodexAgent {
             .config_options(load.config_options))
     }
 
-    async fn load_session(
+    /// Restore an existing session from its Codex rollout file.
+    ///
+    /// Shared by `load_session` and `resume_session`. The only difference
+    /// is `replay_history`: `session/load` replays the recorded rollout
+    /// items back to the client, while `session/resume` reattaches the
+    /// thread silently (no replay) so a client can transparently restore
+    /// a conversation after an ACP subprocess restart — e.g. when the
+    /// host rotates provider credentials. Returns the `thread.load()`
+    /// result, whose modes/models/config_options the callers re-wrap
+    /// into their respective ACP response types.
+    async fn restore_session(
         &self,
-        request: LoadSessionRequest,
+        session_id: SessionId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
         cx: ConnectionTo<Client>,
+        replay_history: bool,
     ) -> Result<LoadSessionResponse, Error> {
-        info!("Loading session: {}", request.session_id);
         // Check before sending if authentication was successful or not
         self.check_auth().await?;
-
-        let LoadSessionRequest {
-            session_id,
-            cwd,
-            mcp_servers,
-            ..
-        } = request;
 
         let rollout_path = find_thread_path_by_id_str(
             &self.config.codex_home,
@@ -615,16 +640,6 @@ impl CodexAgent {
         .map_err(|e| Error::internal_error().data(e.to_string()))?
         .ok_or_else(|| Error::resource_not_found(None))?;
 
-        let history = RolloutRecorder::get_rollout_history(&rollout_path)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        let rollout_items = match &history {
-            InitialHistory::Resumed(resumed) => resumed.history.clone(),
-            InitialHistory::Forked(items) => items.clone(),
-            InitialHistory::Cleared | InitialHistory::New => Vec::new(),
-        };
-
         let config = self.build_session_config(&cwd, mcp_servers)?;
 
         let NewThread {
@@ -633,7 +648,7 @@ impl CodexAgent {
             session_configured: _,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
-            rollout_path,
+            rollout_path.clone(),
             self.auth_manager.clone(),
             None,
         ))
@@ -650,7 +665,19 @@ impl CodexAgent {
             cx,
         ));
 
-        thread.replay_history(rollout_items).await?;
+        if replay_history {
+            let history = RolloutRecorder::get_rollout_history(&rollout_path)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+            let rollout_items = match &history {
+                InitialHistory::Resumed(resumed) => resumed.history.clone(),
+                InitialHistory::Forked(items) => items.clone(),
+                InitialHistory::Cleared | InitialHistory::New => Vec::new(),
+            };
+
+            thread.replay_history(rollout_items).await?;
+        }
 
         let load = thread.load().await?;
 
@@ -660,7 +687,52 @@ impl CodexAgent {
             .insert(session_id.clone(), config.cwd.to_path_buf());
         self.sessions.lock().unwrap().insert(session_id, thread);
 
+        Ok(load)
+    }
+
+    async fn load_session(
+        &self,
+        request: LoadSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> Result<LoadSessionResponse, Error> {
+        info!("Loading session: {}", request.session_id);
+
+        let LoadSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        let load = self
+            .restore_session(session_id, cwd, mcp_servers, cx, true)
+            .await?;
+
         Ok(LoadSessionResponse::new()
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options))
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> Result<ResumeSessionResponse, Error> {
+        info!("Resuming session: {}", request.session_id);
+
+        let ResumeSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        let load = self
+            .restore_session(session_id, cwd, mcp_servers, cx, false)
+            .await?;
+
+        Ok(ResumeSessionResponse::new()
             .modes(load.modes)
             .models(load.models)
             .config_options(load.config_options))
