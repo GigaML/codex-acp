@@ -1,0 +1,232 @@
+name: Giga Release (linux musl bridge build)
+
+# Builds static musl linux binaries (x64 + arm64) and publishes them as
+# GitHub Release assets for consumption by the GigaML/trillions
+# chat-agent image. This is a temporary bridge — once upstream
+# zed-industries/codex-acp releases include our session/resume patch we
+# flip the trillions Dockerfile pin back to the official npm package and
+# delete this fork. Track exit criterion via the linked Linear ticket.
+#
+# Trigger: push a tag of the form `v<upstream>-giga.<n>` (e.g.
+# `v0.14.0-giga.1`). The workflow attaches the codex-acp binary + a
+# sha256 checksum file to a new GitHub Release named after the tag.
+#
+# Targets we publish:
+#   - x86_64-unknown-linux-musl  (E2B/Modal x64, CI)
+#   - aarch64-unknown-linux-musl (E2B/Modal arm64, Apple Silicon local)
+#
+# Static musl: no glibc dependency, drops into any linux image.
+
+on:
+  push:
+    tags:
+      - 'v*-giga.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing tag to (re-)release. Must match v*-giga.*"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Use hermetic Cargo home (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.target }}-cargo-registry-
+
+      - name: Cache cargo git index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.target }}-cargo-git-
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config libcap-dev libubsan1
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install musl build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Configure musl rusty_v8 artifact overrides
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # denoland/rusty_v8 does not publish musl prebuilts; reuse the
+          # ones hosted on upstream openai/codex releases (same mechanism
+          # upstream codex-acp release.yml uses).
+          version=$(python3 -c "
+          import tomllib, pathlib
+          lock = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          vs = [p['version'] for p in lock['package'] if p['name'] == 'v8']
+          assert len(vs) == 1, f'expected 1 v8 version, got {vs}'
+          print(vs[0])
+          ")
+          release_tag="rusty-v8-v${version}"
+          base_url="https://github.com/openai/codex/releases/download/${release_tag}"
+          archive="${base_url}/librusty_v8_release_${TARGET}.a.gz"
+          binding_dir="${RUNNER_TEMP}/rusty_v8"
+          binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
+          mkdir -p "${binding_dir}"
+          curl -fsSL "${base_url}/src_binding_release_${TARGET}.rs" -o "${binding_path}"
+          echo "RUSTY_V8_ARCHIVE=${archive}" >> "$GITHUB_ENV"
+          echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "$GITHUB_ENV"
+
+      - name: Clear sanitizer flags (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Match upstream release.yml: prevent host/proc-macro builds
+          # from pulling in UBSan via runner-injected flags.
+          echo "RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_ENCODED_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "RUSTDOCFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" >> "$GITHUB_ENV"
+          sanitize_flags() {
+            local input="$1"
+            input="${input//-fsanitize=undefined/}"
+            input="${input//-fno-sanitize-recover=undefined/}"
+            input="${input//-fno-sanitize-trap=undefined/}"
+            echo "$input"
+          }
+          echo "CFLAGS=$(sanitize_flags "${CFLAGS-}")" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=$(sanitize_flags "${CXXFLAGS-}")" >> "$GITHUB_ENV"
+          # aws-lc-sys jitterentropy picks up runner UBSan flags via
+          # cmake; disable to match upstream Bazel/MODULE setup.
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage release asset (binary + sha256)
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag_name || github.ref_name }}"
+          asset="codex-acp-${tag}-${{ matrix.target }}"
+          src="target/${{ matrix.target }}/release/codex-acp"
+          # Strip to keep the asset small (debug symbols not needed in the
+          # chat-agent image).
+          strip "${src}" || true
+          mkdir -p dist
+          cp "${src}" "dist/${asset}"
+          ( cd dist && sha256sum "${asset}" > "${asset}.sha256" )
+          echo "asset_path=dist/${asset}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=dist/${asset}.sha256" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-acp-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag_name || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v.+-giga\..+$ ]]; then
+            echo "Refusing: tag '$tag' does not match v*-giga.* (fork release scheme)." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            **GigaML bridge release** of `zed-industries/codex-acp` with the
+            ENG-7412 `session/resume` patch on top of upstream
+            `${{ steps.tag.outputs.tag }}`.
+
+            This release is a temporary bridge so the trillions chat-agent
+            image can ship `session/resume` for Codex before upstream
+            cuts a release. The trillions Dockerfile pins one of the
+            binaries below by sha256.
+
+            Artifacts:
+            - `codex-acp-${{ steps.tag.outputs.tag }}-x86_64-unknown-linux-musl` (+ `.sha256`)
+            - `codex-acp-${{ steps.tag.outputs.tag }}-aarch64-unknown-linux-musl` (+ `.sha256`)
+
+            Static musl linux binaries — drop into any linux image; no
+            glibc dependency.
+          files: artifacts/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
